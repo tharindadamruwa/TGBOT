@@ -1,6 +1,7 @@
 import os
 import asyncio
-from pytube import YouTube
+import logging
+from yt_dlp import YoutubeDL
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -10,93 +11,198 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import humanize
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("TOKEN environment variable not set")
+
+# In-memory storage to map user to current download info
 user_data = {}
-MAX_MB = 2000
 
-def clean_filename(name):
-    return "".join(c if c.isalnum() or c in " ._-" else "_" for c in name)
+# Helper function to format progress bar and info
+def progress_bar(percentage, length=20):
+    filled_len = int(length * percentage // 100)
+    bar = "█" * filled_len + "—" * (length - filled_len)
+    return f"[{bar}] {percentage:.1f}%"
 
-async def safe_edit_message(msg, new_text):
-    try:
-        if msg.text != new_text:
-            await msg.edit_text(new_text)
-    except Exception as e:
-        print(f"[EDIT ERROR] {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📥 Send a YouTube video link.")
+    await update.message.reply_text("Send me a YouTube video link and I'll help you download it!")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    chat_id = update.message.chat_id
-
-    if "youtube.com" not in url and "youtu.be" not in url:
-        await update.message.reply_text("❌ Invalid YouTube URL.")
+    text = update.message.text.strip()
+    if not ("youtube.com/watch" in text or "youtu.be/" in text):
+        await update.message.reply_text("Please send a valid YouTube video link.")
         return
 
-    user_data[chat_id] = {"url": url}
-    await update.message.reply_text("🔍 Getting video info...")
+    msg = await update.message.reply_text("Fetching video info...")
+
+    # Get video info & qualities using yt-dlp
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+    }
 
     try:
-        yt = YouTube(url)
-        title = clean_filename(yt.title)
-        streams = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc()
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(text, download=False)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Failed to fetch: {e}")
+        await msg.edit_text(f"Failed to extract info: {e}")
         return
 
+    # Filter only video formats with height and filesize
+    formats = [
+        f
+        for f in info.get("formats", [])
+        if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("filesize") and f.get("height")
+    ]
+
+    if not formats:
+        await msg.edit_text("No downloadable video formats found.")
+        return
+
+    # Prepare quality buttons - unique by height + fps + format id
+    qualities = {}
     buttons = []
-    for s in streams:
-        mb = round(s.filesize / (1024 * 1024), 2)
-        label = f"{s.resolution} - {mb} MB"
-        buttons.append([InlineKeyboardButton(label, callback_data=s.itag)])
+    for f in formats:
+        label = f"{f['height']}p"
+        if f.get("fps"):
+            label += f" {f['fps']}fps"
+        label += f" ({humanize.naturalsize(f['filesize'], binary=True)})"
+        qualities[label] = f["format_id"]
 
-    markup = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(f"🎬 *{title}*\nSelect a quality:", parse_mode="Markdown", reply_markup=markup)
+    # Deduplicate buttons by label keeping highest filesize
+    filtered = {}
+    for label, fid in qualities.items():
+        # keep latest only
+        filtered[label] = fid
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Create inline buttons
+    for label, fid in filtered.items():
+        buttons.append([InlineKeyboardButton(label, callback_data=f"dl:{fid}")])
+
+    user_data[update.effective_user.id] = {
+        "url": text,
+        "title": info.get("title", "video"),
+        "formats": {v: k for k, v in filtered.items()},  # format_id -> label
+        "message": msg,
+    }
+
+    await msg.edit_text(
+        f"Select quality for:\n*{info.get('title','')}*",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+
+async def download_progress_hook(update, context, user_id, progress_message, d):
+    # d is yt-dlp progress dict
+    status = d.get("status")
+    if status == "downloading":
+        total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+        downloaded_bytes = d.get("downloaded_bytes") or 0
+        percent = downloaded_bytes / total_bytes * 100
+        speed = d.get("speed") or 0
+        eta = d.get("eta") or 0
+
+        bar = progress_bar(percent)
+        speed_str = humanize.naturalsize(speed, binary=True) + "/s" if speed else "N/A"
+        eta_str = f"{int(eta)}s" if eta else "N/A"
+        text = (
+            f"Downloading:\n{bar}\n"
+            f"Downloaded: {humanize.naturalsize(downloaded_bytes, binary=True)} / {humanize.naturalsize(total_bytes, binary=True)}\n"
+            f"Speed: {speed_str} | ETA: {eta_str}"
+        )
+
+        try:
+            # Edit progress message every 1 second approx
+            # Use asyncio.ensure_future to not block
+            await progress_message.edit_text(text)
+        except Exception:
+            pass  # ignore edit failures
+
+    elif status == "finished":
+        await progress_message.edit_text("Download finished, sending file...")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat_id
-    itag = int(query.data)
-    url = user_data.get(chat_id, {}).get("url")
-    if not url:
-        await query.edit_message_text("❌ No video URL found.")
+
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        await query.edit_message_text("Session expired. Please send the YouTube link again.")
         return
 
-    yt = YouTube(url)
-    stream = yt.streams.get_by_itag(itag)
-    title = clean_filename(yt.title)
-    filename = stream.default_filename or f"{title}.mp4"
+    format_id = query.data.split(":")[1]
+    data = user_data[user_id]
+    url = data["url"]
+    title = data["title"]
+    format_label = data["formats"].get(format_id, "unknown quality")
 
-    progress_msg = await query.edit_message_text("⬇️ Downloading video...")
-    await asyncio.to_thread(stream.download, filename=filename)
+    # Send a message for progress updates
+    progress_message = await query.edit_message_text(
+        f"Starting download of *{title}* in quality: *{format_label}* ...",
+        parse_mode="Markdown",
+    )
 
-    size_mb = os.path.getsize(filename) / (1024 * 1024)
-    if size_mb > MAX_MB:
-        await safe_edit_message(progress_msg, f"⚠️ File too large: {round(size_mb, 2)} MB (limit 2 GB)")
-        os.remove(filename)
-        return
-
-    await safe_edit_message(progress_msg, "📤 Uploading to Telegram...")
-    await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+    # yt-dlp download options
+    ydl_opts = {
+        "format": format_id,
+        "outtmpl": f"{title}.%(ext)s",
+        "quiet": True,
+        "progress_hooks": [lambda d: asyncio.create_task(download_progress_hook(update, context, user_id, progress_message, d))],
+        "no_warnings": True,
+    }
 
     try:
-        with open(filename, "rb") as f:
-            await context.bot.send_document(chat_id=chat_id, document=f, filename=filename, caption=title)
-        await safe_edit_message(progress_msg, "✅ Sent!")
-    except Exception as e:
-        await safe_edit_message(progress_msg, f"❌ Upload failed: {e}")
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
+        # Run download in thread to not block event loop
+        loop = asyncio.get_event_loop()
+        with YoutubeDL(ydl_opts) as ydl:
+            info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+            filename = ydl.prepare_filename(info_dict)
 
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button))
-    print("🤖 Bot running with pytube...")
-    app.run_polling()
+        await progress_message.edit_text("Uploading video to Telegram...")
+
+        # Send video as document
+        async with context.bot:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=open(filename, "rb"),
+                filename=f"{title}.mp4",
+                caption=title,
+            )
+
+        await progress_message.delete()
+        os.remove(filename)
+        del user_data[user_id]
+
+    except Exception as e:
+        await progress_message.edit_text(f"Error during download/upload:\n{e}")
+
+
+async def main():
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern=r"^dl:"))
+
+    print("Bot started...")
+    await application.run_polling()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
