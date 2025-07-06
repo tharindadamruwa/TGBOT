@@ -7,6 +7,8 @@ from telegram.ext import (
 )
 
 TOKEN = TOKEN = os.getenv("BOT_TOKEN")
+print("BOT TOKEN:", TOKEN)  # Remove this later for security
+
 user_data = {}  # user_id -> dict with url & formats
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
