@@ -5,19 +5,17 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
-import sys
-print("Python version:", sys.version)
 
-TOKEN = TOKEN = os.getenv("BOT_TOKEN")
-print("BOT TOKEN:", TOKEN)  # Remove this later for security
-
-user_data = {}  # user_id -> dict with url & formats
+TOKEN = os.getenv("BOT_TOKEN")
+user_data = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send me a YouTube link to get started!")
+    await update.message.reply_text("🎬 Send a YouTube link to download!")
 
 def get_formats(url):
-    ydl_opts = {}
+    ydl_opts = {
+        'cookiefile': 'cookies.txt'
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         formats = [
@@ -33,72 +31,73 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         title, formats = get_formats(url)
     except Exception as e:
-        await update.message.reply_text("Failed to fetch video formats.")
+        await update.message.reply_text("❌ Failed to fetch video details.")
         return
 
     keyboard = []
-    buttons = []
     for f in formats:
-        label = f"{f.get('format_note', '')} - {round(f.get('filesize', 0)/1024/1024, 1)} MB"
-        if label.strip() == "- 0.0 MB":
-            continue
-        buttons.append(InlineKeyboardButton(label, callback_data=str(f['format_id'])))
-        if len(buttons) == 2:
-            keyboard.append(buttons)
-            buttons = []
-    if buttons:
-        keyboard.append(buttons)
+        fmt_note = f.get("format_note") or f.get("resolution") or "?"
+        size_mb = f.get("filesize", 0)
+        if size_mb:
+            label = f"{fmt_note} - {round(size_mb / 1024 / 1024, 1)} MB"
+        else:
+            label = fmt_note
+        keyboard.append([InlineKeyboardButton(label, callback_data=f["format_id"])])
 
-    user_data[user_id] = {'url': url, 'formats': formats, 'title': title}
+    user_data[user_id] = {"url": url, "formats": formats, "title": title}
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"Choose quality for: *{title}*", reply_markup=reply_markup, parse_mode='Markdown')
+    await update.message.reply_text(
+        f"🎞 *{title}*\nSelect a quality to download:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-
-    format_id = query.data
     data = user_data.get(user_id)
+
     if not data:
-        await query.edit_message_text("Session expired. Please send the URL again.")
+        await query.edit_message_text("⚠️ Session expired. Send the link again.")
         return
 
-    url = data['url']
-    title = data['title']
-    formats = data['formats']
+    url = data["url"]
+    format_id = query.data
+    title = data["title"]
+    safe_title = title.replace(" ", "_").replace("/", "_")
+    filename = f"{safe_title}.mp4"
 
-    output_file = f"{title}.mp4".replace(" ", "_").replace("/", "_")
-
-    await query.edit_message_text("Downloading video...")
-
-    ydl_opts = {
-        'format': format_id,
-        'outtmpl': output_file,
-        'quiet': True,
-        'noplaylist': True,
-    }
+    await query.edit_message_text("⬇️ Downloading...")
 
     try:
+        ydl_opts = {
+            "format": format_id,
+            "outtmpl": filename,
+            "cookiefile": "cookies.txt",
+            "quiet": True,
+            "noplaylist": True,
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except Exception as e:
-        await query.edit_message_text("Download failed.")
+        await query.edit_message_text("❌ Download failed.")
         return
 
     await context.bot.send_document(
         chat_id=query.message.chat_id,
-        document=open(output_file, 'rb'),
-        filename=output_file
+        document=open(filename, "rb"),
+        filename=filename
     )
-    os.remove(output_file)
 
+    os.remove(filename)
+
+# Setup app
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 app.add_handler(CallbackQueryHandler(button))
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import asyncio
     asyncio.run(app.run_polling())
