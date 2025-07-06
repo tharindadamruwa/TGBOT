@@ -6,7 +6,7 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-TOKEN = "123456789:ABCdefGHIJKlmNOPqrSTUvwxYZ"
+TOKEN = TOKEN = os.getenv("BOT_TOKEN")
 user_data = {}  # user_id -> dict with url & formats
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
