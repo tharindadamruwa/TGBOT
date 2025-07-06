@@ -5,6 +5,8 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+import sys
+print("Python version:", sys.version)
 
 TOKEN = TOKEN = os.getenv("BOT_TOKEN")
 print("BOT TOKEN:", TOKEN)  # Remove this later for security
